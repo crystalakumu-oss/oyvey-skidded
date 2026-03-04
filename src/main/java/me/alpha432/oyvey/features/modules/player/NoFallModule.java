@@ -6,7 +6,7 @@ import net.minecraft.network.protocol.game.ServerboundMovePlayerPacket;
 
 public class NoFallModule extends Module {
     public NoFallModule() {
-        super("LebronJames", "Removes fall damage", Category.PLAYER);
+        super("Nofall", "Removes fall damage", Category.PLAYER);
     }
 
     @Override
