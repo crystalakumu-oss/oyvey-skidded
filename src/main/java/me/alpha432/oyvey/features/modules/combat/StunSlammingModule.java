@@ -3,219 +3,238 @@ package me.alpha432.oyvey.features.modules.combat;
 import me.alpha432.oyvey.features.modules.Module;
 import me.alpha432.oyvey.features.settings.Setting;
 import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
-import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
 import net.minecraft.util.Hand;
-import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Vec3d;
 
 import java.util.Random;
 
 public class StunSlammingModule extends Module {
     
-    // ==================== KONFIGURIERBARE SETTINGS ====================
-    // --- Wahrscheinlichkeit ---
-    private final Setting<Integer> stunChance = this.register(new Setting<>("Chance %", 100, 0, 100));
+    // SETTINGS
+    private final Setting<Integer> stunChance = this.register(new Setting<>("StunChance", 100, 0, 100));
+    private final Setting<Integer> minDelay = this.register(new Setting<>("MinDelay", 2, 0, 10));
+    private final Setting<Integer> maxDelay = this.register(new Setting<>("MaxDelay", 5, 0, 10));
+    private final Setting<Boolean> randomize = this.register(new Setting<>("Randomize", true));
+    private final Setting<Double> range = this.register(new Setting<>("Range", 4.5, 1.0, 6.0));
+    private final Setting<Boolean> rotate = this.register(new Setting<>("Rotate", true));
+    private final Setting<Boolean> criticals = this.register(new Setting<>("Criticals", true));
+    private final Setting<Boolean> autoSwitchBack = this.register(new Setting<>("AutoSwitchBack", true));
+    private final Setting<Integer> minFallHeight = this.register(new Setting<>("MinFallHeight", 3, 1, 10));
+    private final Setting<Boolean> inventory = this.register(new Setting<>("Inventory", false));
+    private final Setting<Boolean> debug = this.register(new Setting<>("Debug", true));
     
-    // --- Tick-Randomizer ---
-    private final Setting<Integer> minTickDelay = this.register(new Setting<>("Min Ticks", 2, 0, 12));
-    private final Setting<Integer> maxTickDelay = this.register(new Setting<>("Max Ticks", 8, 0, 12));
-    private final Setting<Boolean> randomizeTicks = this.register(new Setting<>("Randomize", true));
-    
-    // --- REICHWEITE (min und max Blöcke) ---
-    private final Setting<Double> minRange = this.register(new Setting<>("Min Range", 3.0, 1.0, 6.0));
-    private final Setting<Double> maxRange = this.register(new Setting<>("Max Range", 4.5, 1.0, 6.0));
-    
-    // --- Optionale Features ---
-    private final Setting<Boolean> rotateToTarget = this.register(new Setting<>("Rotate", true));
-    private final Setting<Boolean> useCriticals = this.register(new Setting<>("Criticals", true));
-    
-    // ==================== INTERNE VARIABLEN ====================
+    // INTERNE VARIABLEN
     private final Random random = new Random();
-    private int currentTickDelay = 0;
-    private int tickCounter = 0;
-    private int actionPhase = 0; // 0=idle, 1=switchToAxe, 2=attackAxe, 3=switchToMace, 4=attackMace
+    private final SimpleTimer timer = new SimpleTimer();
     private PlayerEntity target = null;
-    private int failedAttempts = 0;
+    private int stage = 0;
     private int axeSlot = -1;
     private int maceSlot = -1;
+    private int previousSlot = -1;
+    private double fallStartY = 0;
+    private boolean wasFalling = false;
+    private int failedAttempts = 0;
+    private int currentDelay = 0;
     
     public StunSlammingModule() {
-        super("StunSlamming", "Schild brechen mit Axt + Slam mit Mace im Fall (1.21.11)", Category.COMBAT);
+        super("StunSlamming", "Breaks shield with axe then slams with mace while falling", Category.COMBAT);
+    }
+    
+    @Override
+    public void onEnable() {
+        if (mc.player == null) {
+            this.disable();
+            return;
+        }
+        
+        stage = 0;
+        target = null;
+        failedAttempts = 0;
+        wasFalling = false;
+        timer.reset();
+        
+        if (debug.getValue()) {
+            this.sendMessage("§a[StunSlamming] §fModule enabled!");
+        }
     }
     
     @Override
     public void onTick() {
-        if (mc.player == null || mc.world == null || !this.isEnabled()) return;
+        if (mc.player == null || mc.world == null) return;
         
-        // Prüfen ob wir fallen (Stun Slam nur im Fall möglich)
-        if (!isFalling()) {
-            reset();
-            return;
+        // Fall tracking - YARN MAPPINGS: isOnGround() -> isOnGround(), getVelocity() -> getVelocity(), getY() -> getY()
+        if (!mc.player.isOnGround() && mc.player.getVelocity().y < 0) {
+            if (!wasFalling) {
+                wasFalling = true;
+                fallStartY = mc.player.getY();
+                if (debug.getValue()) {
+                    this.sendMessage("§7[Debug] Started falling from Y: " + fallStartY);
+                }
+            }
+        } else {
+            wasFalling = false;
         }
         
-        // Gegner finden der blockt und in Reichweite ist
-        PlayerEntity blockTarget = findBlockingTarget();
-        if (blockTarget == null) {
-            reset();
-            return;
+        // Check if falling high enough
+        boolean validFall = wasFalling && (fallStartY - mc.player.getY()) >= minFallHeight.getValue();
+        
+        if (validFall && stage == 0) {
+            findTargetAndStart();
         }
         
-        // State Machine
-        switch (actionPhase) {
-            case 0:
-                handleIdle(blockTarget);
-                break;
+        switch (stage) {
             case 1:
+                if (timer.passedMs(currentDelay)) {
+                    switchToAxe();
+                }
+                break;
             case 2:
+                if (timer.passedMs(currentDelay)) {
+                    performAxeAttack();
+                }
+                break;
             case 3:
+                if (timer.passedMs(currentDelay)) {
+                    switchToMace();
+                }
+                break;
             case 4:
-                handleWaiting();
+                if (timer.passedMs(currentDelay)) {
+                    performSlam();
+                }
                 break;
         }
     }
     
-    private void handleIdle(PlayerEntity blockTarget) {
-        // Zufällige Chance prüfen
+    private void findTargetAndStart() {
         if (random.nextInt(100) >= stunChance.getValue()) {
             failedAttempts++;
             return;
         }
         
-        // Inventar-Slots finden
-        axeSlot = findBestAxe();
+        target = findBlockingTarget();
+        if (target == null) return;
+        
+        axeSlot = findAxeSlot();
+        if (axeSlot == -1 && inventory.getValue()) {
+            axeSlot = findAxeInInventory();
+        }
+        
         maceSlot = findMaceSlot();
+        if (maceSlot == -1 && inventory.getValue()) {
+            maceSlot = findMaceInInventory();
+        }
         
         if (axeSlot == -1 || maceSlot == -1) return;
         
-        target = blockTarget;
-        actionPhase = 1;
-        currentTickDelay = getNextDelay();
-        tickCounter = 0;
+        previousSlot = mc.player.getInventory().selectedSlot;
         
-        if (rotateToTarget.getValue()) {
-            rotateToTarget();
+        if (debug.getValue()) {
+            this.sendMessage("§a[StunSlamming] §fTarget: " + target.getName().getString());
         }
+        
+        stage = 1;
+        currentDelay = getNextDelay();
+        timer.reset();
     }
     
-    private void handleWaiting() {
-        tickCounter++;
-        if (tickCounter >= currentTickDelay) {
-            executeAction();
-        }
-    }
-    
-    private void executeAction() {
-        if (target == null || mc.player == null) {
+    private void switchToAxe() {
+        if (axeSlot != -1) {
+            if (axeSlot < 9) {
+                mc.player.getInventory().selectedSlot = axeSlot;
+            }
+            stage = 2;
+            currentDelay = getNextDelay();
+            timer.reset();
+        } else {
             reset();
-            return;
-        }
-        
-        switch (actionPhase) {
-            case 1: // Zur Axt wechseln
-                if (axeSlot != -1) {
-                    mc.player.getInventory().selectedSlot = axeSlot;
-                    actionPhase = 2;
-                    currentTickDelay = getNextDelay();
-                    tickCounter = 0;
-                } else reset();
-                break;
-                
-            case 2: // Mit Axt angreifen (Schild brechen)
-                attackTarget();
-                actionPhase = 3;
-                currentTickDelay = getNextDelay();
-                tickCounter = 0;
-                break;
-                
-            case 3: // Zur Mace wechseln
-                if (maceSlot != -1) {
-                    mc.player.getInventory().selectedSlot = maceSlot;
-                    actionPhase = 4;
-                    currentTickDelay = getNextDelay();
-                    tickCounter = 0;
-                } else reset();
-                break;
-                
-            case 4: // Mit Mace angreifen (Der Slam!)
-                attackTarget();
-                if (useCriticals.getValue() && mc.player.isOnGround()) {
-                    doCriticalPacket();
-                }
-                failedAttempts = 0;
-                reset();
-                break;
         }
     }
     
-    private void attackTarget() {
+    private void performAxeAttack() {
         if (target == null || mc.player == null || mc.interactionManager == null) return;
         
-        // Prüfen ob Ziel noch blockt und in Reichweite ist
         double distance = mc.player.distanceTo(target);
-        if (!target.isBlocking() || distance < minRange.getValue() || distance > maxRange.getValue()) {
+        if (!target.isBlocking() || distance > range.getValue()) {
             reset();
             return;
         }
         
         mc.interactionManager.attackEntity(mc.player, target);
         mc.player.swingHand(Hand.MAIN_HAND);
+        
+        stage = 3;
+        currentDelay = getNextDelay();
+        timer.reset();
     }
     
-    private void doCriticalPacket() {
-        if (mc.player == null) return;
-        
-        Vec3d pos = mc.player.getPos();
-        mc.player.networkHandler.sendPacket(new PlayerMoveC2SPacket.PositionAndOnGround(pos.x, pos.y + 0.0625, pos.z, false));
-        mc.player.networkHandler.sendPacket(new PlayerMoveC2SPacket.PositionAndOnGround(pos.x, pos.y, pos.z, false));
+    private void switchToMace() {
+        if (maceSlot != -1) {
+            if (maceSlot < 9) {
+                mc.player.getInventory().selectedSlot = maceSlot;
+            }
+            stage = 4;
+            currentDelay = getNextDelay();
+            timer.reset();
+        } else {
+            reset();
+        }
     }
     
-    private int getNextDelay() {
-        if (!randomizeTicks.getValue()) {
-            return (minTickDelay.getValue() + maxTickDelay.getValue()) / 2;
+    private void performSlam() {
+        if (target == null || mc.player == null || mc.interactionManager == null) return;
+        
+        double distance = mc.player.distanceTo(target);
+        if (distance > range.getValue()) {
+            reset();
+            return;
         }
         
-        if (maxTickDelay.getValue() <= minTickDelay.getValue()) {
-            return minTickDelay.getValue();
+        mc.interactionManager.attackEntity(mc.player, target);
+        mc.player.swingHand(Hand.MAIN_HAND);
+        
+        // Criticals are handled automatically in 1.21.11 when falling
+        
+        if (autoSwitchBack.getValue() && previousSlot != -1 && previousSlot < 9) {
+            mc.player.getInventory().selectedSlot = previousSlot;
         }
         
-        // Zufälliger Delay zwischen Min und Max
-        int delay = minTickDelay.getValue() + random.nextInt(maxTickDelay.getValue() - minTickDelay.getValue() + 1);
-        
-        // Dynamische Anpassung bei sehr schnellem Fall
-        if (mc.player != null && mc.player.getVelocity().y < -0.8) {
-            delay = Math.max(minTickDelay.getValue(), delay - 1);
-        }
-        
-        return Math.max(minTickDelay.getValue(), Math.min(maxTickDelay.getValue(), delay));
-    }
-    
-    private boolean isFalling() {
-        if (mc.player == null) return false;
-        return mc.player.getVelocity().y < -0.3 && !mc.player.isOnGround();
+        failedAttempts = 0;
+        reset();
     }
     
     private PlayerEntity findBlockingTarget() {
-        if (mc.player == null || mc.world == null) return null;
-        
-        // Nur Gegner in der eingestellten Reichweite
-        double currentMaxRange = maxRange.getValue();
+        if (mc.world == null || mc.player == null) return null;
         
         for (PlayerEntity player : mc.world.getPlayers()) {
             if (player == mc.player) continue;
             if (!player.isBlocking()) continue;
             
             double distance = mc.player.distanceTo(player);
-            if (distance >= minRange.getValue() && distance <= currentMaxRange && mc.player.canSee(player)) {
+            if (distance <= range.getValue()) {
                 return player;
             }
         }
         return null;
     }
     
-    private int findBestAxe() {
+    private int findAxeSlot() {
         for (int i = 0; i < 9; i++) {
-            var stack = mc.player.getInventory().getStack(i);
+            ItemStack stack = mc.player.getInventory().getStack(i);
+            if (stack.getItem() == Items.NETHERITE_AXE ||
+                stack.getItem() == Items.DIAMOND_AXE ||
+                stack.getItem() == Items.IRON_AXE) {
+                return i;
+            }
+        }
+        return -1;
+    }
+    
+    private int findAxeInInventory() {
+        for (int i = 9; i < 36; i++) {
+            ItemStack stack = mc.player.getInventory().getStack(i);
             if (stack.getItem() == Items.NETHERITE_AXE ||
                 stack.getItem() == Items.DIAMOND_AXE ||
                 stack.getItem() == Items.IRON_AXE) {
@@ -234,21 +253,39 @@ public class StunSlammingModule extends Module {
         return -1;
     }
     
-    private void rotateToTarget() {
-        if (target == null || mc.player == null) return;
+    private int findMaceInInventory() {
+        for (int i = 9; i < 36; i++) {
+            if (mc.player.getInventory().getStack(i).getItem() == Items.MACE) {
+                return i;
+            }
+        }
+        return -1;
+    }
+    
+    private int getNextDelay() {
+        if (!randomize.getValue()) {
+            return (minDelay.getValue() + maxDelay.getValue()) / 2;
+        }
         
-        double dx = target.getX() - mc.player.getX();
-        double dz = target.getZ() - mc.player.getZ();
-        float yaw = (float) (Math.atan2(dz, dx) * 180 / Math.PI) - 90;
-        mc.player.setYaw(yaw);
+        if (maxDelay.getValue() <= minDelay.getValue()) {
+            return minDelay.getValue();
+        }
+        
+        return minDelay.getValue() + random.nextInt(maxDelay.getValue() - minDelay.getValue() + 1);
     }
     
     public void reset() {
-        actionPhase = 0;
+        stage = 0;
         target = null;
-        tickCounter = 0;
-        axeSlot = -1;
-        maceSlot = -1;
+        timer.reset();
+    }
+    
+    @Override
+    public void onDisable() {
+        reset();
+        if (debug.getValue()) {
+            this.sendMessage("§c[StunSlamming] Module disabled");
+        }
     }
     
     @Override
@@ -256,5 +293,18 @@ public class StunSlammingModule extends Module {
         if (target != null) return target.getName().getString();
         if (failedAttempts > 0) return failedAttempts + " fails";
         return null;
+    }
+    
+    // EINFACHER INTERNER TIMER
+    private class SimpleTimer {
+        private long time = System.currentTimeMillis();
+        
+        public void reset() {
+            time = System.currentTimeMillis();
+        }
+        
+        public boolean passedMs(long ms) {
+            return System.currentTimeMillis() - time >= ms;
+        }
     }
 }
